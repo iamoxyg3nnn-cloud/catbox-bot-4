@@ -3,8 +3,8 @@ name: Catbox Spoke bot-4
 # One Discord bot per repository. This spoke runs with NODE_MODE=node, holds a
 # single bot token, and exposes itself to the hub through a per-session
 # Cloudflare quick tunnel. It does NOT run the admin console, job runner,
-# metadata mirror or expiry purge (all single-writer). Each run queues its own
-# successor so the spoke stays online by chaining, never by a cron trigger.
+# metadata mirror or expiry purge (all single-writer). Runs do not self-chain/queue successors; retrigger manually
+# or via an external watcher/dispatch when needed.
 #
 # Like the hub, this runs on a windows-latest GitHub-hosted runner. Its D:
 # drive (~150 GiB) is transient staging (D:\catbox_staging) for the life of the
@@ -26,7 +26,7 @@ concurrency:
 
 permissions:
   contents: read
-  actions: write
+  actions: read
 
 jobs:
   spoke:
@@ -41,37 +41,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Queue the next session (early insurance)
-        if: always()
-        shell: pwsh
-        env:
-          TRIGGERED_BY: ${{ inputs.triggered_by }}
-          CHAIN_REF: ${{ github.event.repository.default_branch || github.ref_name }}
-        run: |
-          $n = 0
-          if ($env:TRIGGERED_BY -match '^session-chain:(\d{1,9})$') { $n = [int]$Matches[1] }
-          $next = $n + 1
-          $body = @{
-            ref = $env:CHAIN_REF
-            inputs = @{ triggered_by = "session-chain:$next" }
-          } | ConvertTo-Json -Compress -Depth 5
-          $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/workflows/catbox-spoke.yml/dispatches"
-          $headers = @{
-            Authorization = "Bearer $env:GH_TOKEN"
-            Accept = 'application/vnd.github+json'
-            'X-GitHub-Api-Version' = '2022-11-28'
-          }
-          foreach ($attempt in 1..3) {
-            try {
-              Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -ContentType 'application/json' -Body $body | Out-Null
-              Write-Host "Successor queued (attempt $next)."
-              exit 0
-            } catch {
-              Write-Warning "Dispatch attempt $attempt failed: $($_.Exception.Message)"
-              if ($attempt -lt 3) { Start-Sleep -Seconds 15 }
-            }
-          }
-          Write-Error 'Could not queue the next session from the insurance step.'
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -392,56 +361,5 @@ jobs:
             Stop-Process -Id $serverProc.Id -Force -ErrorAction SilentlyContinue
           }
 
-      - name: Queue the next session (session end)
-        if: always()
-        shell: pwsh
-        env:
-          TRIGGERED_BY: ${{ inputs.triggered_by }}
-          CHAIN_REF: ${{ github.event.repository.default_branch || github.ref_name }}
-          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
-        run: |
-          $n = 0
-          if ($env:TRIGGERED_BY -match '^session-chain:(\d{1,9})$') { $n = [int]$Matches[1] }
-          $next = $n + 1
-          if ($env:SESSION_COMPLETE -eq 'true') { $next = 0 }
-
-          if ($next -gt 5) {
-            Write-Warning "::warning::$n consecutive unhealthy spoke sessions; continuing to auto-retry."
-          }
-
-          $body = @{
-            ref = $env:CHAIN_REF
-            inputs = @{ triggered_by = "session-chain:$next" }
-          } | ConvertTo-Json -Compress -Depth 5
-          $uri = "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/actions/workflows/catbox-spoke.yml/dispatches"
-          $headers = @{
-            Authorization = "Bearer $env:GH_TOKEN"
-            Accept = 'application/vnd.github+json'
-            'X-GitHub-Api-Version' = '2022-11-28'
-          }
-          $queued = $false
-          foreach ($attempt in 1..3) {
-            try {
-              Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -ContentType 'application/json' -Body $body | Out-Null
-              $queued = $true
-              break
-            } catch {
-              Write-Warning "Dispatch attempt $attempt failed: $($_.Exception.Message)"
-              if ($attempt -lt 3) { Start-Sleep -Seconds 15 }
-            }
-          }
-          if ($queued) {
-            if ($next -eq 0) { Write-Host "Healthy session complete; successor queued (counter reset)." }
-            else { Write-Host "Successor queued (auto-retry attempt $next)." }
-            exit 0
-          }
-          Write-Error "::error::Could not queue next spoke session from end step after retries; insurance successor may still keep the chain alive."
-          if (-not [string]::IsNullOrWhiteSpace($env:ALERT_WEBHOOK_URL)) {
-            $content = ":warning: **catbox-bot-bot-4** spoke end-step dispatch failed after retries (auto-retry attempt $next)."
-            $payload = @{ content = $content } | ConvertTo-Json -Compress
-            try {
-              Invoke-RestMethod -Method Post -Uri $env:ALERT_WEBHOOK_URL -ContentType 'application/json' -Body $payload | Out-Null
-            } catch { Write-Warning 'Discord alert failed.' }
-          }
 
 # Re-indexed after repository migration to iamoxyg3nnn-cloud.
